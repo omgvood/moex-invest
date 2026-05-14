@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -9,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from requests.exceptions import RequestException
 
-from config import CBR_KEY_RATE, LAST_PRICES_BATCH, SQLITE_PATH, excel_path
+from config import CBR_KEY_RATE, DATA_DIR, LAST_PRICES_BATCH, SQLITE_PATH, excel_path
 from storage import init_db, save_snapshot_sqlite, write_excel
 from tbank_client import (
     Bond,
@@ -26,6 +27,34 @@ from ytm import (
     is_floater,
     next_coupon_annual_rate,
 )
+
+
+STATUS_FILE = DATA_DIR / "snapshot_status.json"
+
+
+def _is_pid_alive(pid: int) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, OSError):
+        return False
+
+
+def _read_status() -> dict | None:
+    if not STATUS_FILE.exists():
+        return None
+    try:
+        return json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _write_status(state: dict) -> None:
+    tmp = STATUS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(STATUS_FILE)
 
 
 RISK_LEVEL_MAP = {
@@ -149,60 +178,107 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Снапшот облигаций T-Bank в Excel + SQLite")
     parser.add_argument("--limit", type=int, default=None,
                         help="Обработать не более N облигаций (для теста)")
+    parser.add_argument("--force", action="store_true",
+                        help="Запустить даже если другой снапшот уже идёт")
     args = parser.parse_args()
+
+    # Гард против параллельных запусков
+    existing = _read_status()
+    if existing and existing.get("running") and _is_pid_alive(existing.get("pid", 0)) and not args.force:
+        print(
+            f"Снапшот уже запущен (pid {existing['pid']}). "
+            "Используйте --force, чтобы всё равно запустить.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     load_dotenv()
     token = os.getenv("TBANK_TOKEN")
+    started_at = datetime.now(timezone.utc).isoformat()
     if not token:
+        _write_status({
+            "running": False, "pid": os.getpid(), "phase": "error",
+            "current": 0, "total": 0,
+            "started_at": started_at, "finished_at": started_at,
+            "error": "TBANK_TOKEN не найден. Заполните .env",
+        })
         print("ERROR: TBANK_TOKEN не найден. Заполните .env", file=sys.stderr)
         sys.exit(1)
 
+    def status(phase: str, current: int = 0, total: int = 0,
+               error: str | None = None, finished: bool = False) -> None:
+        _write_status({
+            "running": not finished and error is None,
+            "pid": os.getpid(),
+            "phase": phase,
+            "current": current,
+            "total": total,
+            "started_at": started_at,
+            "finished_at": datetime.now(timezone.utc).isoformat() if (finished or error) else None,
+            "error": error,
+        })
+
     snapshot_ts = datetime.now(timezone.utc)
     now = snapshot_ts
-    print(f"[{snapshot_ts:%Y-%m-%d %H:%M:%S %Z}] Снапшот стартует")
+    total = 0
 
-    init_db(SQLITE_PATH)
+    try:
+        status("starting")
+        print(f"[{snapshot_ts:%Y-%m-%d %H:%M:%S %Z}] Снапшот стартует")
 
-    with open_client(token) as client:
-        print("1/3  Каталог облигаций...")
-        bonds = get_tradable_bonds(client)
-        if args.limit:
-            bonds = bonds[: args.limit]
-        print(f"     найдено: {len(bonds)}")
+        init_db(SQLITE_PATH)
 
-        print("2/3  Последние цены...")
-        figis = [b.figi for b in bonds]
-        prices = get_last_prices_map(client, figis, LAST_PRICES_BATCH)
-        print(f"     цены получены: {len(prices)}")
+        with open_client(token) as client:
+            status("catalog")
+            print("1/3  Каталог облигаций...")
+            bonds = get_tradable_bonds(client)
+            if args.limit:
+                bonds = bonds[: args.limit]
+            total = len(bonds)
+            print(f"     найдено: {total}")
 
-        print("3/3  Купоны + расчёт YTM...")
-        rows: list[dict] = []
-        total = len(bonds)
-        horizon = now + timedelta(days=365 * 50)
-        t0 = time.monotonic()
-        for i, b in enumerate(bonds, 1):
-            try:
-                coupons = get_bond_coupons(client, b.figi, now, horizon)
-            except RequestException as e:
-                print(f"     [warn] {b.isin}: {e}", file=sys.stderr)
-                coupons = []
+            status("prices", current=0, total=total)
+            print("2/3  Последние цены...")
+            figis = [b.figi for b in bonds]
+            prices = get_last_prices_map(client, figis, LAST_PRICES_BATCH)
+            print(f"     цены получены: {len(prices)}")
 
-            rows.append(build_row(b, prices.get(b.figi), coupons, now, snapshot_ts))
+            print("3/3  Купоны + расчёт YTM...")
+            status("coupons", current=0, total=total)
+            rows: list[dict] = []
+            horizon = now + timedelta(days=365 * 50)
+            t0 = time.monotonic()
+            for i, b in enumerate(bonds, 1):
+                try:
+                    coupons = get_bond_coupons(client, b.figi, now, horizon)
+                except RequestException as e:
+                    print(f"     [warn] {b.isin}: {e}", file=sys.stderr)
+                    coupons = []
 
-            if i % 25 == 0 or i == total:
-                elapsed = time.monotonic() - t0
-                rate = i / elapsed if elapsed else 0
-                eta = (total - i) / rate if rate else 0
-                print(f"     {i}/{total}  ~{rate:.1f}/s  ETA {eta/60:.1f} мин")
+                rows.append(build_row(b, prices.get(b.figi), coupons, now, snapshot_ts))
 
-    print("Пишу SQLite...")
-    save_snapshot_sqlite(SQLITE_PATH, rows)
+                if i % 5 == 0 or i == total:
+                    status("coupons", current=i, total=total)
+                if i % 25 == 0 or i == total:
+                    elapsed = time.monotonic() - t0
+                    rate = i / elapsed if elapsed else 0
+                    eta = (total - i) / rate if rate else 0
+                    print(f"     {i}/{total}  ~{rate:.1f}/s  ETA {eta/60:.1f} мин")
 
-    xlsx = excel_path(snapshot_ts.astimezone())
-    print(f"Пишу Excel: {xlsx}")
-    write_excel(xlsx, rows)
+        status("saving", current=total, total=total)
+        print("Пишу SQLite...")
+        save_snapshot_sqlite(SQLITE_PATH, rows)
 
-    print(f"Готово. Строк: {len(rows)}")
+        xlsx = excel_path(snapshot_ts.astimezone())
+        print(f"Пишу Excel: {xlsx}")
+        write_excel(xlsx, rows)
+
+        status("done", current=total, total=total, finished=True)
+        print(f"Готово. Строк: {len(rows)}")
+
+    except Exception as e:  # noqa: BLE001
+        status("error", current=total, total=total, error=str(e)[:300])
+        raise
 
 
 if __name__ == "__main__":

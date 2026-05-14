@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -8,9 +13,13 @@ import plotly.express as px
 import streamlit as st
 from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
 from st_aggrid.shared import DataReturnMode, GridUpdateMode
+from streamlit_autorefresh import st_autorefresh
 
 ROOT = Path(__file__).resolve().parent
-DB_PATH = ROOT / "data" / "bonds.sqlite"
+DATA_DIR = ROOT / "data"
+DB_PATH = DATA_DIR / "bonds.sqlite"
+STATUS_FILE = DATA_DIR / "snapshot_status.json"
+SNAPSHOT_LOG = DATA_DIR / "snapshot.log"
 
 st.set_page_config(page_title="Облигации T-Bank", layout="wide")
 
@@ -94,19 +103,128 @@ def label_of(col: str) -> str:
     return LABELS.get(col, col)
 
 
+# ---------- Snapshot trigger / status ----------
+PHASE_LABELS = {
+    "starting": "Запуск…",
+    "catalog":  "Загружаем каталог облигаций…",
+    "prices":   "Получаем последние цены…",
+    "coupons":  "Купоны и расчёт доходностей",
+    "saving":   "Сохраняем в БД и Excel…",
+    "done":     "Готово",
+    "error":    "Ошибка",
+}
+
+
+def _is_pid_alive(pid: int) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, OSError):
+        return False
+
+
+def read_status() -> dict | None:
+    if not STATUS_FILE.exists():
+        return None
+    try:
+        return json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def snapshot_running(status: dict | None) -> bool:
+    if not status or not status.get("running"):
+        return False
+    return _is_pid_alive(status.get("pid", 0))
+
+
+def trigger_snapshot() -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    log = open(SNAPSHOT_LOG, "a", buffering=1, encoding="utf-8")
+    popen_kwargs: dict = {
+        "cwd": str(ROOT),
+        "stdout": log,
+        "stderr": subprocess.STDOUT,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+    subprocess.Popen(
+        [sys.executable, str(ROOT / "bonds_snapshot.py")],
+        **popen_kwargs,
+    )
+
+
 # ---------- UI ----------
 st.title("Облигации T-Bank — аналитический дашборд")
 
-if not DB_PATH.exists():
-    st.error(
-        f"Не нашёл базу `{DB_PATH}`. Сначала запустите снапшот:\n\n"
-        "```cmd\npython bonds_snapshot.py\n```"
-    )
-    st.stop()
+# --- Sidebar: refresh button + status (всегда виден, даже если данных ещё нет) ---
+status = read_status()
+running = snapshot_running(status)
 
+# Если был запуск и он завершился — сбросить кэш данных, чтобы подтянуть новое
+if st.session_state.get("snapshot_was_running") and not running:
+    st.session_state["snapshot_was_running"] = False
+    st.cache_data.clear()
+    if status and status.get("error"):
+        st.sidebar.error(f"Прошлый прогон упал: {status['error'][:200]}")
+    else:
+        st.toast("Данные обновлены")
+
+st.sidebar.header("Обновление данных")
+
+if running:
+    st.session_state["snapshot_was_running"] = True
+    phase = (status or {}).get("phase", "")
+    phase_label = PHASE_LABELS.get(phase, phase)
+    total = (status or {}).get("total") or 0
+    current = (status or {}).get("current") or 0
+
+    if total > 0:
+        pct = min(current / total, 1.0)
+        st.sidebar.progress(
+            pct, text=f"{phase_label} — {current}/{total}"
+        )
+    else:
+        st.sidebar.info(phase_label)
+
+    started_at = (status or {}).get("started_at")
+    if started_at:
+        st.sidebar.caption(f"Старт: {started_at[:16].replace('T', ' ')} UTC")
+
+    st_autorefresh(interval=2000, key="snapshot_poll")
+else:
+    if st.sidebar.button(
+        "Получить актуальные данные",
+        type="primary",
+        use_container_width=True,
+    ):
+        trigger_snapshot()
+        st.session_state["snapshot_was_running"] = True
+        time.sleep(0.5)  # дать subprocess'у записать "starting"
+        st.rerun()
+
+    if status:
+        fin = status.get("finished_at")
+        if fin:
+            ts_short = fin[:16].replace("T", " ")
+            if status.get("error"):
+                st.sidebar.caption(f"Прошлый прогон упал в {ts_short} UTC")
+            else:
+                st.sidebar.caption(f"Последнее обновление: {ts_short} UTC")
+
+# --- Проверка наличия данных ---
 snapshots = list_snapshots()
 if not snapshots:
-    st.error("В базе нет снапшотов. Запустите `python bonds_snapshot.py`.")
+    st.info(
+        "В базе пока нет снапшотов. Нажмите **«Получить актуальные данные»** "
+        "в левой панели — первый снапшот занимает 5–7 минут."
+    )
     st.stop()
 
 selected_ts = st.sidebar.selectbox(
