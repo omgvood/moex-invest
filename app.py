@@ -254,8 +254,20 @@ else:
     hover_cols = [c for c in ["isin", "name", "yield_date_type", "yield_pct", "yield_formula"]
                   if c in df.columns]
 
+    # size требует неотрицательные числа без NaN — иначе plotly падает.
+    plot_df = df
+    if size_col != "—":
+        plot_df = df.dropna(subset=[size_col]).copy()
+        if (plot_df[size_col] < 0).any():
+            plot_df[size_col] = plot_df[size_col].abs()
+        dropped = len(df) - len(plot_df)
+        if dropped:
+            st.caption(
+                f"Для размера точки исключено {dropped} строк без значения «{label_of(size_col)}»."
+            )
+
     kwargs: dict = {
-        "data_frame": df, "x": x_col,
+        "data_frame": plot_df, "x": x_col,
         "hover_data": hover_cols,
         "labels": LABELS,
     }
@@ -264,7 +276,6 @@ else:
     if color_col != "—":
         kwargs["color"] = color_col
     if size_col != "—":
-        # size требует положительные значения
         kwargs["size"] = size_col
 
     try:
