@@ -259,6 +259,12 @@ gb = GridOptionsBuilder.from_dataframe(display_df)
 gb.configure_default_column(
     filter=True, sortable=True, resizable=True, minWidth=110,
 )
+# Разрешаем выделять текст в ячейках и копировать (Ctrl+C).
+# enableRangeSelection — Enterprise-фича, но enableCellTextSelection достаточно.
+gb.configure_grid_options(
+    enableCellTextSelection=True,
+    ensureDomOrder=True,
+)
 for col in display_df.columns:
     header = label_of(col)
     if col == "coupon_quantity_per_year":
@@ -301,17 +307,36 @@ for col in BOOL_COLS:
 
 st.caption(f"Отфильтровано в таблице: **{len(filtered)}** из {len(display_df)}")
 
-# Download
-csv_bytes = (
-    filtered.rename(columns={c: label_of(c) for c in filtered.columns})
-    .to_csv(index=False).encode("utf-8-sig")
-)
-st.download_button(
-    "Скачать отфильтрованное (CSV)",
-    csv_bytes,
-    file_name=f"bonds_filtered_{selected_ts[:10]}.csv",
-    mime="text/csv",
-)
+# Скачать данные: xlsx (полный снапшот) и CSV (текущая выборка)
+xlsx_files = sorted(DATA_DIR.glob("bonds_*.xlsx"), key=lambda p: p.stat().st_mtime)
+latest_xlsx = xlsx_files[-1] if xlsx_files else None
+
+col_xlsx, col_csv = st.columns(2)
+with col_xlsx:
+    if latest_xlsx:
+        st.download_button(
+            "Скачать xlsx (полный снапшот)",
+            data=latest_xlsx.read_bytes(),
+            file_name=latest_xlsx.name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            help="Файл с диска сервера — все облигации, с форматированием.",
+        )
+    else:
+        st.caption("xlsx-файл снапшота не найден.")
+with col_csv:
+    csv_bytes = (
+        filtered.rename(columns={c: label_of(c) for c in filtered.columns})
+        .to_csv(index=False).encode("utf-8-sig")
+    )
+    st.download_button(
+        "Скачать CSV (текущая выборка)",
+        csv_bytes,
+        file_name=f"bonds_filtered_{selected_ts[:10]}.csv",
+        mime="text/csv",
+        use_container_width=True,
+        help="Только то, что сейчас в таблице после фильтров.",
+    )
 
 # ---------- Dynamic chart on filtered data ----------
 st.subheader("Динамический график — по отфильтрованной таблице")
