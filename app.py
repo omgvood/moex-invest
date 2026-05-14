@@ -6,6 +6,8 @@ from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
+from st_aggrid.shared import DataReturnMode, GridUpdateMode
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "data" / "bonds.sqlite"
@@ -19,7 +21,6 @@ LABELS: dict[str, str] = {
     "yield_date_type":          "Тип даты",
     "yield_pct":                "Доходность, %",
     "yield_formula":            "Формула флоатера",
-    "yield_display":            "Доходность, %",
     "years_to_date":            "Лет до даты",
     "maturity_date":            "Дата погашения",
     "last_price_pct":           "Цена, % от номинала",
@@ -38,12 +39,20 @@ LABELS: dict[str, str] = {
     "snapshot_ts":              "Снапшот",
 }
 
-NUMERIC_FILTERS = [
+NUMERIC_COLS = {
     "yield_pct", "years_to_date", "last_price_pct",
-    "coupon_yield_pct", "current_yield_pct",
+    "coupon_yield_pct", "current_yield_pct", "coupon_quantity_per_year",
+    "aci", "nominal",
+}
+BOOL_COLS = ["amortization", "perpetual", "floater"]
+TABLE_COLS = [
+    "isin", "name", "yield_date", "yield_date_type",
+    "yield_pct", "yield_formula", "years_to_date",
+    "maturity_date", "last_price_pct",
+    "coupon_yield_pct", "current_yield_pct", "coupon_quantity_per_year",
+    "aci", "aci_currency", "nominal", "nominal_currency",
+    "risk_level", "amortization", "perpetual", "floater", "figi",
 ]
-CATEGORICAL_FILTERS = ["yield_date_type", "risk_level", "nominal_currency"]
-BOOL_FILTERS = ["amortization", "perpetual", "floater"]
 
 
 @st.cache_data
@@ -52,8 +61,7 @@ def list_snapshots() -> list[str]:
         return []
     with sqlite3.connect(DB_PATH) as con:
         return pd.read_sql(
-            "SELECT DISTINCT snapshot_ts FROM snapshots ORDER BY snapshot_ts DESC",
-            con,
+            "SELECT DISTINCT snapshot_ts FROM snapshots ORDER BY snapshot_ts DESC", con
         )["snapshot_ts"].tolist()
 
 
@@ -62,10 +70,9 @@ def load_snapshot(snapshot_ts: str) -> pd.DataFrame:
     with sqlite3.connect(DB_PATH) as con:
         df = pd.read_sql(
             "SELECT * FROM snapshots WHERE snapshot_ts = ?",
-            con,
-            params=[snapshot_ts],
+            con, params=[snapshot_ts],
         )
-    for col in BOOL_FILTERS:
+    for col in BOOL_COLS:
         if col in df.columns:
             df[col] = df[col].astype("boolean").fillna(False).astype(bool)
     return df
@@ -75,14 +82,9 @@ def load_snapshot(snapshot_ts: str) -> pd.DataFrame:
 def load_history(isin: str) -> pd.DataFrame:
     with sqlite3.connect(DB_PATH) as con:
         df = pd.read_sql(
-            """
-            SELECT snapshot_ts, last_price_pct, yield_pct, current_yield_pct
-            FROM snapshots
-            WHERE isin = ?
-            ORDER BY snapshot_ts
-            """,
-            con,
-            params=[isin],
+            """SELECT snapshot_ts, last_price_pct, yield_pct, current_yield_pct
+               FROM snapshots WHERE isin = ? ORDER BY snapshot_ts""",
+            con, params=[isin],
         )
     df["snapshot_ts"] = pd.to_datetime(df["snapshot_ts"])
     return df
@@ -108,92 +110,84 @@ if not snapshots:
     st.stop()
 
 selected_ts = st.sidebar.selectbox(
-    "Снапшот",
-    snapshots,
+    "Снапшот", snapshots,
     format_func=lambda s: s.replace("T", " ")[:16] + " UTC",
 )
 
 raw = load_snapshot(selected_ts)
-total = len(raw)
-df = raw.copy()
-
-st.sidebar.header("Фильтры")
-
-# Числовые фильтры (range slider)
-for col in NUMERIC_FILTERS:
-    if col not in df.columns:
-        continue
-    series = df[col].dropna()
-    if series.empty:
-        continue
-    vmin, vmax = float(series.min()), float(series.max())
-    if vmin == vmax:
-        continue
-    rng = st.sidebar.slider(label_of(col), vmin, vmax, (vmin, vmax))
-    df = df[df[col].between(rng[0], rng[1]) | df[col].isna()]
-
-# Категориальные (multiselect)
-for col in CATEGORICAL_FILTERS:
-    if col not in df.columns:
-        continue
-    opts = sorted([v for v in df[col].dropna().unique().tolist() if v != ""])
-    if not opts:
-        continue
-    sel = st.sidebar.multiselect(label_of(col), opts, default=opts)
-    df = df[df[col].isin(sel)]
-
-# Булевы (Все / Да / Нет)
-for col in BOOL_FILTERS:
-    if col not in df.columns:
-        continue
-    choice = st.sidebar.radio(
-        label_of(col), ["Все", "Да", "Нет"], horizontal=True, key=f"bool_{col}"
-    )
-    if choice == "Да":
-        df = df[df[col]]
-    elif choice == "Нет":
-        df = df[~df[col]]
-
-# Поиск
-search = st.sidebar.text_input("Поиск (ISIN / название)")
-if search:
-    mask = (
-        df["isin"].str.contains(search, case=False, na=False)
-        | df["name"].str.contains(search, case=False, na=False)
-    )
-    df = df[mask]
-
-st.sidebar.caption(f"Найдено: **{len(df)}** из {total}")
-
-# ---------- Таблица ----------
-st.subheader(f"Таблица — {len(df)} облигаций")
-
-display_df = df.copy()
-display_df["yield_display"] = display_df["yield_pct"].apply(
-    lambda v: f"{v:.2f}" if pd.notna(v) else None
-)
-display_df["yield_display"] = display_df["yield_display"].fillna(
-    display_df["yield_formula"]
+st.sidebar.caption(f"В снапшоте: **{len(raw)}** облигаций")
+st.sidebar.markdown(
+    "**Фильтры** — в заголовках столбцов таблицы (значок «☰» справа от названия).\n\n"
+    "Поддерживается: содержит / равно / больше / меньше / между, сортировка по клику."
 )
 
-table_cols = [
-    "isin", "name", "yield_date", "yield_date_type", "yield_display",
-    "years_to_date", "maturity_date", "last_price_pct",
-    "coupon_yield_pct", "current_yield_pct", "coupon_quantity_per_year",
-    "aci", "nominal", "nominal_currency", "risk_level",
-    "amortization", "perpetual", "floater", "figi",
-]
-table_cols = [c for c in table_cols if c in display_df.columns]
-st.dataframe(
-    display_df[table_cols].rename(columns={c: label_of(c) for c in table_cols}),
-    use_container_width=True,
-    hide_index=True,
+# ---------- Table with per-column Excel-style filters ----------
+st.subheader("Таблица")
+
+display_df = raw.copy()
+# Преобразуем булевы в «да»/«нет» — для текстового фильтра AgGrid Community.
+for col in BOOL_COLS:
+    if col in display_df.columns:
+        display_df[col] = display_df[col].map({True: "да", False: "нет"})
+
+table_cols = [c for c in TABLE_COLS if c in display_df.columns]
+display_df = display_df[table_cols]
+
+num_formatter = JsCode(
+    "function(p){return p.value==null||p.value===''?'':Number(p.value).toFixed(2)}"
 )
 
-# Скачать отфильтрованное в CSV
-csv_bytes = display_df[table_cols].rename(
-    columns={c: label_of(c) for c in table_cols}
-).to_csv(index=False).encode("utf-8-sig")
+gb = GridOptionsBuilder.from_dataframe(display_df)
+gb.configure_default_column(
+    filter=True, sortable=True, resizable=True, minWidth=110,
+)
+for col in display_df.columns:
+    header = label_of(col)
+    if col == "coupon_quantity_per_year":
+        gb.configure_column(
+            col, header_name=header,
+            type=["numericColumn"], filter="agNumberColumnFilter",
+        )
+    elif col in NUMERIC_COLS:
+        gb.configure_column(
+            col, header_name=header,
+            type=["numericColumn"], filter="agNumberColumnFilter",
+            valueFormatter=num_formatter,
+        )
+    else:
+        gb.configure_column(col, header_name=header, filter="agTextColumnFilter")
+
+gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=30)
+grid_options = gb.build()
+
+grid_response = AgGrid(
+    display_df,
+    gridOptions=grid_options,
+    height=520,
+    update_mode=GridUpdateMode.MODEL_CHANGED,
+    data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+    fit_columns_on_grid_load=False,
+    allow_unsafe_jscode=True,
+    theme="streamlit",
+)
+
+filtered = pd.DataFrame(grid_response["data"])
+# AgGrid иногда возвращает числовые колонки строками — приводим обратно.
+for col in NUMERIC_COLS:
+    if col in filtered.columns:
+        filtered[col] = pd.to_numeric(filtered[col], errors="coerce")
+# Восстанавливаем booleans для графика.
+for col in BOOL_COLS:
+    if col in filtered.columns:
+        filtered[col] = filtered[col].map({"да": True, "нет": False}).fillna(False).astype(bool)
+
+st.caption(f"Отфильтровано в таблице: **{len(filtered)}** из {len(display_df)}")
+
+# Download
+csv_bytes = (
+    filtered.rename(columns={c: label_of(c) for c in filtered.columns})
+    .to_csv(index=False).encode("utf-8-sig")
+)
 st.download_button(
     "Скачать отфильтрованное (CSV)",
     csv_bytes,
@@ -201,17 +195,17 @@ st.download_button(
     mime="text/csv",
 )
 
-# ---------- Динамический график ----------
-st.subheader("Динамический график")
+# ---------- Dynamic chart on filtered data ----------
+st.subheader("Динамический график — по отфильтрованной таблице")
 
-if df.empty:
-    st.info("Нет данных под текущие фильтры.")
+if filtered.empty:
+    st.info("В таблице нет строк под текущие фильтры — график не строится.")
 else:
     numeric_cols = [
-        c for c in df.columns
-        if pd.api.types.is_numeric_dtype(df[c]) and not pd.api.types.is_bool_dtype(df[c])
+        c for c in filtered.columns
+        if pd.api.types.is_numeric_dtype(filtered[c]) and not pd.api.types.is_bool_dtype(filtered[c])
     ]
-    all_cols = list(df.columns)
+    all_cols = list(filtered.columns)
 
     c1, c2, c3, c4, c5 = st.columns(5)
     chart_type = c1.selectbox("Тип", ["Scatter", "Histogram", "Box", "Bar"])
@@ -226,9 +220,7 @@ else:
         x_options = numeric_cols + [c for c in all_cols if c not in numeric_cols]
         x_default = _default_idx(x_options, "years_to_date")
 
-    x_col = c2.selectbox(
-        "X", x_options, index=x_default, format_func=label_of,
-    )
+    x_col = c2.selectbox("X", x_options, index=x_default, format_func=label_of)
 
     y_col = None
     if chart_type in ("Scatter", "Bar", "Box"):
@@ -251,16 +243,17 @@ else:
             format_func=lambda c: "—" if c == "—" else label_of(c),
         )
 
-    hover_cols = [c for c in ["isin", "name", "yield_date_type", "yield_pct", "yield_formula"]
-                  if c in df.columns]
+    hover_cols = [
+        c for c in ["isin", "name", "yield_date_type", "yield_pct", "yield_formula"]
+        if c in filtered.columns
+    ]
 
-    # size требует неотрицательные числа без NaN — иначе plotly падает.
-    plot_df = df
+    plot_df = filtered
     if size_col != "—":
-        plot_df = df.dropna(subset=[size_col]).copy()
+        plot_df = filtered.dropna(subset=[size_col]).copy()
         if (plot_df[size_col] < 0).any():
             plot_df[size_col] = plot_df[size_col].abs()
-        dropped = len(df) - len(plot_df)
+        dropped = len(filtered) - len(plot_df)
         if dropped:
             st.caption(
                 f"Для размера точки исключено {dropped} строк без значения «{label_of(size_col)}»."
@@ -292,15 +285,15 @@ else:
     except Exception as e:
         st.error(f"Ошибка построения графика: {e}")
 
-# ---------- История по облигации ----------
+# ---------- History ----------
 st.subheader("История по облигации")
 
 if len(snapshots) < 2:
     st.info("История появится после второго запуска `python bonds_snapshot.py`.")
 else:
-    options = sorted(df["isin"].tolist())
+    options = sorted(filtered["isin"].dropna().tolist()) if "isin" in filtered.columns else []
     if not options:
-        st.info("Уточните фильтры — список ISIN пуст.")
+        st.info("Уточните фильтры в таблице — список ISIN пуст.")
     else:
         sel_isin = st.selectbox("ISIN", options)
         hist = load_history(sel_isin)
