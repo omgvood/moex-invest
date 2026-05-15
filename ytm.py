@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from typing import Optional
 
 YEAR_SECONDS = 365.25 * 86400
@@ -140,3 +141,72 @@ def next_coupon_annual_rate(
     if not future:
         return None
     return future[0].pay_one_bond * coupons_per_year / nominal * 100
+
+
+def expand_amortization(
+    coupons,
+    current_nominal: float,
+    coupons_per_year: int,
+    now: datetime,
+) -> tuple[list, float]:
+    """Восстанавливает график амортизации из убывающих купонов.
+
+    Для амортизируемых бумаг T-Bank API уже возвращает в `pay_one_bond` процент
+    на ОСТАТОЧНЫЙ номинал каждого периода. То есть купоны убывают по мере того,
+    как номинал гасится. Зная купон_n и зная, что для первого будущего периода
+    остаточный номинал равен `current_nominal`, можно вычислить годовую ставку
+    купона `r = первый_купон × N / current_nominal`. Дальше для каждого периода
+    `nominal_n = купон_n × N / r`, и амортизация в этом периоде равна разнице
+    `nominal_n − nominal_{n+1}` (для последнего периода — это сам `nominal_n`).
+
+    Возвращает (coupons_с_встроенной_амортизацией, 0.0). Нулевой остаточный
+    номинал в конце означает, что всё уже возвращено через амортизационные
+    выплаты — calc_yield_to правильно не добавит ничего на дату погашения.
+
+    Ограничения:
+      • предполагает константную ставку `r` на всю бумагу (для step-up купонов
+        даст погрешность);
+      • амортизация считается в купонные даты (для бумаг с отдельным графиком
+        амортизации модель приближённая).
+    """
+    if not coupons or not current_nominal or coupons_per_year <= 0:
+        return list(coupons), current_nominal
+
+    future = sorted(
+        [c for c in coupons if c.coupon_date and c.coupon_date > now],
+        key=lambda c: c.coupon_date,
+    )
+    if not future:
+        return list(coupons), 0.0
+
+    first = future[0]
+    if not first.pay_one_bond or first.pay_one_bond <= 0:
+        return list(coupons), current_nominal
+
+    r = first.pay_one_bond * coupons_per_year / current_nominal
+    if not (0.001 < r < 5):
+        return list(coupons), current_nominal
+
+    # Остаточный номинал на каждый будущий период (на начало периода).
+    nominals: list[float] = []
+    for c in future:
+        amt = c.pay_one_bond or 0
+        if amt <= 0:
+            return list(coupons), current_nominal
+        nominals.append(amt * coupons_per_year / r)
+
+    # Купоны с встроенной амортизацией.
+    augmented: list = []
+    for i, c in enumerate(future):
+        amort = nominals[i] - nominals[i + 1] if i + 1 < len(future) else nominals[i]
+        if amort < 0:
+            # step-up купон или другая нестандартная схема — наша эвристика
+            # ломается, откатываемся на старую логику с полным номиналом в конце.
+            return list(coupons), current_nominal
+        augmented.append(SimpleNamespace(
+            coupon_date=c.coupon_date,
+            pay_one_bond=c.pay_one_bond + amort,
+            coupon_type=c.coupon_type,
+        ))
+
+    return augmented, 0.0

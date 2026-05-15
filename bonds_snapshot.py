@@ -24,6 +24,7 @@ from ytm import (
     YEAR_SECONDS,
     calc_yield_to,
     detect_put_date,
+    expand_amortization,
     is_floater,
     next_coupon_annual_rate,
 )
@@ -134,8 +135,17 @@ def build_row(
         yield_date_type = "Погашение"
         if price_abs is not None:
             try:
+                if bond.amortization_flag:
+                    # Восстанавливаем график амортизации из убывающих купонов:
+                    # терминальный номинал = 0 (всё гасится частями).
+                    cash_coupons, terminal_nominal = expand_amortization(
+                        coupons, nominal, bond.coupon_quantity_per_year, now,
+                    )
+                else:
+                    cash_coupons, terminal_nominal = coupons, nominal
                 y = calc_yield_to(
-                    price_abs + bond.aci, coupons, bond.maturity_date, nominal, now
+                    price_abs + bond.aci, cash_coupons, bond.maturity_date,
+                    terminal_nominal, now,
                 )
                 if y is not None:
                     yield_pct = y * 100

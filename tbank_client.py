@@ -19,7 +19,8 @@ class Bond:
     figi: str
     name: str
     maturity_date: Optional[datetime]
-    nominal: float
+    nominal: float            # текущий остаточный номинал
+    initial_nominal: float    # номинал при размещении (для амортизируемых)
     nominal_currency: str
     aci: float
     aci_currency: str
@@ -127,13 +128,19 @@ def get_tradable_bonds(client: TBankClient) -> list[Bond]:
         if not (b.get("apiTradeAvailableFlag") and b.get("buyAvailableFlag")):
             continue
         nominal_m = b.get("nominal") or {}
+        initial_nominal_m = b.get("initialNominal") or {}
         aci_m = b.get("aciValue") or {}
+        nominal_val = _money_to_decimal(nominal_m)
+        initial_nominal_val = _money_to_decimal(initial_nominal_m)
+        if not initial_nominal_val:
+            initial_nominal_val = nominal_val  # запасной вариант
         bonds.append(Bond(
             isin=b.get("isin", "") or "",
             figi=b.get("figi", "") or "",
             name=b.get("name", "") or "",
             maturity_date=_parse_iso(b.get("maturityDate")),
-            nominal=_money_to_decimal(nominal_m),
+            nominal=nominal_val,
+            initial_nominal=initial_nominal_val,
             nominal_currency=nominal_m.get("currency", "") or "",
             aci=_money_to_decimal(aci_m),
             aci_currency=aci_m.get("currency", "") or "",
